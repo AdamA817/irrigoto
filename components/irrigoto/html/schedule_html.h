@@ -205,7 +205,7 @@ select:focus,input[type="time"]:focus{outline:1px solid var(--green);}
 
 <script>
 const DAY_LABELS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-const MODE_LABELS = ['Pulse','Gentle','Smooth','Serpentine'];
+const MODE_LABELS = ['Pulse','Gentle','Smooth','Serpentine','Plants'];
 // Depth is eighths of an inch, indexed by the stored value (1..8); index 0 is
 // an unused placeholder. Deeper targets are achieved as multiple 1/8" passes
 // (same as the other modes), so Smooth is no longer 1/8"-only.
@@ -436,6 +436,7 @@ function renderEntry(e, idx) {
           '<option value="1"' + (e.mode===1?' selected':'') + '>Gentle</option>' +
           '<option value="2"' + (e.mode===2?' selected':'') + '>Smooth</option>' +
           '<option value="3"' + (e.mode===3?' selected':'') + '>Serpentine</option>' +
+          '<option value="4"' + (e.mode===4?' selected':'') + '>Plants</option>' +
         '</select></div>' +
       '<div class="col"><label>Depth</label>' +
         '<select data-k="depth">' +

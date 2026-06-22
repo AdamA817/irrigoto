@@ -231,6 +231,9 @@ section{margin-bottom:18px;}
       <button class="mode-btn" data-mode="8" onclick="selMode(this)">
         Serpentine 1/8&Prime; <span>continuous glide &middot; multipass</span>
       </button>
+      <button class="mode-btn" data-mode="9" onclick="selMode(this)">
+        Plants <span>anonymous saved spots</span>
+      </button>
       <button class="mode-btn" data-mode="d" onclick="selMode(this)">
         Demo <span>max speed</span>
       </button>

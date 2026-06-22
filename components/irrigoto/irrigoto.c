@@ -212,10 +212,44 @@ static volatile int  s_water_cleanup_pass = 0; // 0=not in cleanup, N=cleanup pa
 // b311: chase mode -- entertainment watering for dogs/kids. Lissajous-wander
 // (bearing, throw) inside the zone polygon for N minutes (1..10). No coverage
 // guarantees; the goal is a slowly-moving stream the chaser can dodge.
+#define WATER_MODE_PLANTS      9     // anonymous plant/spot targets in the current zone
 #define WATER_MODE_CHASE       50
 #define CHASE_MIN_MINUTES      1
 #define CHASE_MAX_MINUTES      10
+#define PLANT_SPOT_MAX         16
+#define PLANT_DEFAULT_GAL_X10  10    // 1.0 gal/spot
+#define PLANT_DEFAULT_RADIUS_MM 350
+#define PLANT_DEFAULT_GPM_X10  10    // conservative 1.0 gal/min estimate
+#define PLANT_MAX_GAL_X10      100   // 10 gal/spot safety cap
+#define PLANT_MAX_RUNTIME_S    300   // cap per spot
+typedef struct __attribute__((packed)) {
+    float bearing_deg;
+    float throw_mm;
+    uint16_t radius_mm;
+    uint16_t _pad;
+} plant_spot_t;
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t enabled;
+    uint8_t count;
+    uint8_t _pad0;
+    uint16_t gal_x10;
+    uint16_t weekly_limit_x10;
+    uint16_t default_radius_mm;
+    uint16_t gpm_x10;
+    plant_spot_t spots[PLANT_SPOT_MAX];
+} plant_zone_cfg_t;
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t week_start;
+    uint16_t used_x10;
+    uint16_t _pad;
+} plant_usage_t;
+#define PLANT_CFG_MAGIC   0x504C4E54u  // 'PLNT'
+#define PLANT_USAGE_MAGIC 0x50555345u  // 'PUSE'
 static int           s_chase_duration_min = 0; // 1..10; only valid when s_web_water_mode == WATER_MODE_CHASE
+static int           s_plant_override_gal_x10 = 0; // optional one-shot override for plant mode
 // EXP (2026-06-06): lash experiment (reversal dead-time / hysteresis). Runs in
 // its own PRO_CPU task like watering; mutually exclusive with watering + cal.
 static volatile bool s_exp_running = false;
@@ -1891,6 +1925,9 @@ static void phase_valve_hysteresis(void);   // EXP: reversal dead-time + hystere
 static void phase_encoder_health(void);
 static float zone_get_psi_max(void);
 static float cal_throw_to_valve_deg(float throw_mm);
+static void phase_water_plants(void);
+static esp_err_t plant_cfg_load(uint16_t zone_id, plant_zone_cfg_t *cfg);
+static esp_err_t plant_cfg_save(uint16_t zone_id, const plant_zone_cfg_t *cfg);
 static float cal_get_max_throw_mm(void);
 static float cal_get_min_throw_mm(void);
 // --- Web calibration state machine (declared here so cal_do_pressure_scan can access it) ---
@@ -7383,6 +7420,131 @@ static bool zone_contains_point(const zone_perimeter_t *z,
     return (crossings % 2) == 1;
 }
 
+static void plant_cfg_defaults(plant_zone_cfg_t *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->magic = PLANT_CFG_MAGIC;
+    cfg->version = 1;
+    cfg->enabled = 1;
+    cfg->gal_x10 = PLANT_DEFAULT_GAL_X10;
+    cfg->weekly_limit_x10 = 0;  // 0 = no cap
+    cfg->default_radius_mm = PLANT_DEFAULT_RADIUS_MM;
+    cfg->gpm_x10 = PLANT_DEFAULT_GPM_X10;
+}
+
+static void plant_cfg_key(uint16_t zone_id, char *buf, size_t len)
+{
+    snprintf(buf, len, "plant%03u", (unsigned)zone_id);
+}
+
+static void plant_usage_key(uint16_t zone_id, char *buf, size_t len)
+{
+    snprintf(buf, len, "puse%03u", (unsigned)zone_id);
+}
+
+static esp_err_t plant_cfg_load(uint16_t zone_id, plant_zone_cfg_t *cfg)
+{
+    if (!cfg) return ESP_ERR_INVALID_ARG;
+    plant_cfg_defaults(cfg);
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return ESP_ERR_NOT_FOUND;
+    char key[16]; plant_cfg_key(zone_id, key, sizeof(key));
+    size_t sz = sizeof(*cfg);
+    esp_err_t r = nvs_get_blob(h, key, cfg, &sz);
+    nvs_close(h);
+    if (r != ESP_OK || sz != sizeof(*cfg) || cfg->magic != PLANT_CFG_MAGIC || cfg->version != 1) {
+        plant_cfg_defaults(cfg);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (cfg->count > PLANT_SPOT_MAX) cfg->count = PLANT_SPOT_MAX;
+    if (cfg->gal_x10 == 0 || cfg->gal_x10 > PLANT_MAX_GAL_X10) cfg->gal_x10 = PLANT_DEFAULT_GAL_X10;
+    if (cfg->gpm_x10 == 0) cfg->gpm_x10 = PLANT_DEFAULT_GPM_X10;
+    return ESP_OK;
+}
+
+static esp_err_t plant_cfg_save(uint16_t zone_id, const plant_zone_cfg_t *cfg_in)
+{
+    if (!cfg_in) return ESP_ERR_INVALID_ARG;
+    plant_zone_cfg_t cfg = *cfg_in;
+    cfg.magic = PLANT_CFG_MAGIC;
+    cfg.version = 1;
+    if (cfg.count > PLANT_SPOT_MAX) cfg.count = PLANT_SPOT_MAX;
+    if (cfg.gal_x10 == 0 || cfg.gal_x10 > PLANT_MAX_GAL_X10) cfg.gal_x10 = PLANT_DEFAULT_GAL_X10;
+    if (cfg.gpm_x10 == 0) cfg.gpm_x10 = PLANT_DEFAULT_GPM_X10;
+    nvs_handle_t h;
+    esp_err_t r = nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (r != ESP_OK) return r;
+    char key[16]; plant_cfg_key(zone_id, key, sizeof(key));
+    r = nvs_set_blob(h, key, &cfg, sizeof(cfg));
+    if (r == ESP_OK) r = nvs_commit(h);
+    nvs_close(h);
+    return r;
+}
+
+static uint32_t plant_week_start_epoch(time_t now)
+{
+    if (now < 1700000000) return 0;
+    struct tm lt;
+    localtime_r(&now, &lt);
+    lt.tm_hour = 0; lt.tm_min = 0; lt.tm_sec = 0;
+    time_t midnight = mktime(&lt);
+    if (midnight < 0) return 0;
+    return (uint32_t)(midnight - (time_t)lt.tm_wday * 86400);
+}
+
+static void plant_usage_load(uint16_t zone_id, plant_usage_t *u, time_t now)
+{
+    memset(u, 0, sizeof(*u));
+    u->magic = PLANT_USAGE_MAGIC;
+    u->week_start = plant_week_start_epoch(now);
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+    char key[16]; plant_usage_key(zone_id, key, sizeof(key));
+    size_t sz = sizeof(*u);
+    plant_usage_t tmp = {0};
+    if (nvs_get_blob(h, key, &tmp, &sz) == ESP_OK && sz == sizeof(tmp) &&
+        tmp.magic == PLANT_USAGE_MAGIC && tmp.week_start == u->week_start) {
+        *u = tmp;
+    }
+    nvs_close(h);
+}
+
+static void plant_usage_save(uint16_t zone_id, const plant_usage_t *u)
+{
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    char key[16]; plant_usage_key(zone_id, key, sizeof(key));
+    nvs_set_blob(h, key, u, sizeof(*u));
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static bool plant_weekly_allows(uint16_t zone_id, const plant_zone_cfg_t *cfg, uint16_t gal_x10)
+{
+    if (!cfg || cfg->weekly_limit_x10 == 0) return true;
+    plant_usage_t u;
+    plant_usage_load(zone_id, &u, time(NULL));
+    return (uint32_t)u.used_x10 + gal_x10 <= cfg->weekly_limit_x10;
+}
+
+static void plant_weekly_add(uint16_t zone_id, uint16_t gal_x10)
+{
+    plant_usage_t u;
+    plant_usage_load(zone_id, &u, time(NULL));
+    uint32_t next = (uint32_t)u.used_x10 + gal_x10;
+    u.used_x10 = (uint16_t)((next > 65535u) ? 65535u : next);
+    plant_usage_save(zone_id, &u);
+}
+
+static uint16_t plant_effective_gal_x10(const plant_zone_cfg_t *cfg)
+{
+    int g = s_plant_override_gal_x10 > 0 ? s_plant_override_gal_x10 : (int)cfg->gal_x10;
+    if (g <= 0) g = PLANT_DEFAULT_GAL_X10;
+    if (g > PLANT_MAX_GAL_X10) g = PLANT_MAX_GAL_X10;
+    return (uint16_t)g;
+}
+
+
 // Tighten an arc [lo, hi] to the LONGEST contiguous run of bearings
 // whose (bearing, ring_throw) point lies inside the polygon. Scans
 // [lo, hi] at step_deg increments. If no bearing satisfies PIP,
@@ -9614,6 +9776,115 @@ static bool water_trace_save(uint16_t zone_id)
          s_trace_n_samples > 0
             ? (unsigned)s_trace_samples[s_trace_n_samples - 1].time_s : 0u);
     return true;
+}
+
+
+static void phase_water_plants(void)
+{
+    STEP("Plant Spot Watering");
+
+    plant_zone_cfg_t cfg;
+    if (plant_cfg_load(s_water_zone_id, &cfg) != ESP_OK || cfg.count == 0 || !cfg.enabled) {
+        INFO("Plant mode: no plant spots configured for zone %u.", (unsigned)s_water_zone_id);
+        water_set_status(WATER_STATUS_CANCELLED);
+        return;
+    }
+
+    uint16_t gal_x10 = plant_effective_gal_x10(&cfg);
+    if (!plant_weekly_allows(s_water_zone_id, &cfg, gal_x10)) {
+        INFO("Plant mode: weekly limit reached for zone %u (limit %.1f gal/spot).",
+             (unsigned)s_water_zone_id, cfg.weekly_limit_x10 / 10.0f);
+        water_set_status(WATER_STATUS_CANCELLED);
+        return;
+    }
+
+    zone_perimeter_t zone = {0};
+    bool have_zone = (zone_load_primary(s_water_zone_id, &zone) == ESP_OK && zone.num_points >= 3);
+    if (have_zone) zone_sort_walk_order(&zone);
+
+    float gpm = cfg.gpm_x10 > 0 ? cfg.gpm_x10 / 10.0f : PLANT_DEFAULT_GPM_X10 / 10.0f;
+    if (gpm < 0.2f) gpm = 0.2f;
+    float gal = gal_x10 / 10.0f;
+    uint32_t runtime_s = (uint32_t)ceilf((gal / gpm) * 60.0f);
+    if (runtime_s < 5) runtime_s = 5;
+    if (runtime_s > PLANT_MAX_RUNTIME_S) runtime_s = PLANT_MAX_RUNTIME_S;
+    s_water_est_min = (int)ceilf((runtime_s * cfg.count) / 60.0f);
+    s_eta_anchor_secs = (float)(runtime_s * cfg.count);
+    s_eta_anchor_tick = xTaskGetTickCount();
+
+    INFO("Plant mode: zone %u, %u spots, %.1f gal/spot, %.1f gpm estimate, %us/spot.",
+         (unsigned)s_water_zone_id, cfg.count, gal, gpm, (unsigned)runtime_s);
+
+    adc_setup();
+    sensor_rail_on();
+    motor_rail_on();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    tca_led_set(LED_GREEN);
+
+    bool completed = true;
+    for (uint8_t i = 0; i < cfg.count; i++) {
+        plant_spot_t *sp = &cfg.spots[i];
+        if (sp->throw_mm < 100.0f) continue;
+        if (have_zone && !zone_contains_point(&zone, sp->bearing_deg, sp->throw_mm)) {
+            INFO("Plant spot %u skipped: target %.1f deg / %.0fmm is outside zone.",
+                 (unsigned)i, sp->bearing_deg, sp->throw_mm);
+            continue;
+        }
+        float valve_deg = cal_throw_to_valve_deg(sp->throw_mm);
+        if (valve_deg < 0.0f) {
+            INFO("Plant spot %u aborted: no throw calibration.", (unsigned)i);
+            water_set_status(WATER_STATUS_CANCELLED);
+            completed = false;
+            break;
+        }
+        if (valve_deg < VALVE_CAL_START_DEG) valve_deg = VALVE_CAL_START_DEG;
+        if (valve_deg > VALVE_OPEN_DEG) valve_deg = VALVE_OPEN_DEG;
+
+        INFO("Plant spot %u/%u: bearing %.1f deg throw %.0fmm valve %.1f deg for %us.",
+             (unsigned)(i + 1), (unsigned)cfg.count, sp->bearing_deg, sp->throw_mm,
+             valve_deg, (unsigned)runtime_s);
+
+        if (!nozzle_goto(sp->bearing_deg, 2.0f, 12000, false)) {
+            INFO("Plant spot %u: nozzle aim failed.", (unsigned)i);
+            water_set_status(WATER_STATUS_NOZZLE_FAULT);
+            completed = false;
+            break;
+        }
+        if (!valve_goto(valve_deg, 2.0f, 12000, false)) {
+            INFO("Plant spot %u: valve open failed.", (unsigned)i);
+            water_set_status(WATER_STATUS_NOZZLE_FAULT);
+            completed = false;
+            break;
+        }
+
+        TickType_t start = xTaskGetTickCount();
+        while ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - start) < runtime_s * 1000u) {
+            if (uart_getchar(0) != 0 || s_water_abort) {
+                INFO("Plant mode cancelled.");
+                water_set_status(WATER_STATUS_CANCELLED);
+                completed = false;
+                break;
+            }
+            TOUCH_ACTIVITY();
+            float psi = 0.0f;
+            mprls_read_quiet(&psi);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
+        if (!completed) break;
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
+    motor_rail_off();
+    sensor_rail_off();
+    s_eta_anchor_tick = 0;
+    s_water_est_min = 0;
+    s_plant_override_gal_x10 = 0;
+    if (completed && s_water_status_code == WATER_STATUS_COMPLETED) {
+        plant_weekly_add(s_water_zone_id, gal_x10);
+        INFO("Plant mode complete.");
+    }
 }
 
 static void phase_water_zone(void)
@@ -11902,6 +12173,11 @@ static void phase_water_zone_mode(int mode)
         phase_chase_water_zone();
         return;
     }
+    if (mode == WATER_MODE_PLANTS) {
+        // Plant/spot mode waters anonymous saved targets for the current zone.
+        phase_water_plants();
+        return;
+    }
     if (mode==99) {
         // Demo: temporarily set demo_mode via a shim -- just call with demo flag
         // For now reuse interactive path with demo selection
@@ -13106,6 +13382,7 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
     int mode = mode_s[0]>'0'&&mode_s[0]<='6' ? mode_s[0]-'0' :
                mode_s[0]=='7'                 ? 7  :
                mode_s[0]=='8'                 ? 8  :
+               mode_s[0]=='9'||mode_s[0]=='p'||mode_s[0]=='P' ? WATER_MODE_PLANTS :
                mode_s[0]=='c'||mode_s[0]=='C' ? WATER_MODE_CHASE :
                mode_s[0]=='d'||mode_s[0]=='D' ? 99 : 0;
     uint16_t zone_id = (uint16_t)atoi(id_s);
@@ -13122,6 +13399,16 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
             return ESP_OK;
         }
     }
+    s_plant_override_gal_x10 = 0;
+    if (mode == WATER_MODE_PLANTS) {
+        char gal_q[8] = {0};
+        httpd_query_key_value(body, "gal_x10", gal_q, sizeof(gal_q));
+        int g = atoi(gal_q);
+        if (g > 0) {
+            if (g > PLANT_MAX_GAL_X10) g = PLANT_MAX_GAL_X10;
+            s_plant_override_gal_x10 = g;
+        }
+    }
     if(s_web_water_mode!=0 || s_exp_running){
         httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"already running");
         return ESP_OK;
@@ -13131,7 +13418,8 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
     s_water_run_had_flow  = false;
     s_water_no_flow_streak = 0;
     s_water_est_min = (mode==99)                  ? 2 :
-                      (mode==WATER_MODE_CHASE)    ? duration_min : 13;
+                      (mode==WATER_MODE_CHASE)    ? duration_min :
+                      (mode==WATER_MODE_PLANTS)   ? 1 : 13;
     s_water_zone_id  = zone_id;
     s_chase_duration_min = (mode == WATER_MODE_CHASE) ? duration_min : 0;
     // Optional depth target in eighths of an inch (1..8 = 1/8".. 1"). Absent or
@@ -13139,7 +13427,7 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
     char depth_q[4]={0};
     httpd_query_key_value(body,"depth",depth_q,sizeof(depth_q));
     int depth8_req = atoi(depth_q);
-    s_web_water_depth_eighths = (mode == WATER_MODE_CHASE || depth8_req < 1 || depth8_req > 8)
+    s_web_water_depth_eighths = (mode == WATER_MODE_CHASE || mode == WATER_MODE_PLANTS || depth8_req < 1 || depth8_req > 8)
                                   ? 0 : depth8_req;
     // b423: serpentine tuning params. speed = nozzle dps (3..20; absent/0 ->
     // default 8). dry=1 runs the full serpentine with the valve held
@@ -15203,6 +15491,109 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+
+// GET/POST /api/zone/plants
+// GET query: id=N
+// POST body: id=N&enabled=0|1&gal_x10=N&weekly_limit_x10=N&gpm_x10=N&spots=bearing:throw[:radius];...
+// Spots are anonymous per-zone targets; no per-spot names are stored.
+static esp_err_t api_zone_plants_handler(httpd_req_t *req)
+{
+    char buf[512] = {0};
+    int len = 0;
+    if (req->method == HTTP_GET) {
+        httpd_req_get_url_query_str(req, buf, sizeof(buf));
+    } else {
+        len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+        if (len < 0) len = 0;
+        buf[len] = '\0';
+    }
+
+    char ids[8] = {0};
+    httpd_query_key_value(buf, "id", ids, sizeof(ids));
+    if (!ids[0]) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "id required");
+        return ESP_OK;
+    }
+    uint16_t zid = (uint16_t)atoi(ids);
+
+    plant_zone_cfg_t cfg;
+    plant_cfg_load(zid, &cfg);
+
+    if (req->method == HTTP_POST) {
+        char v[32] = {0};
+        if (httpd_query_key_value(buf, "enabled", v, sizeof(v)) == ESP_OK) cfg.enabled = (uint8_t)(atoi(v) != 0);
+        if (httpd_query_key_value(buf, "gal_x10", v, sizeof(v)) == ESP_OK) {
+            int g = atoi(v);
+            if (g < 1) g = 1;
+            if (g > PLANT_MAX_GAL_X10) g = PLANT_MAX_GAL_X10;
+            cfg.gal_x10 = (uint16_t)g;
+        }
+        if (httpd_query_key_value(buf, "weekly_limit_x10", v, sizeof(v)) == ESP_OK) {
+            int g = atoi(v);
+            if (g < 0) g = 0;
+            if (g > 60000) g = 60000;
+            cfg.weekly_limit_x10 = (uint16_t)g;
+        }
+        if (httpd_query_key_value(buf, "gpm_x10", v, sizeof(v)) == ESP_OK) {
+            int g = atoi(v);
+            if (g < 2) g = 2;
+            if (g > 200) g = 200;
+            cfg.gpm_x10 = (uint16_t)g;
+        }
+        char spots[360] = {0};
+        if (httpd_query_key_value(buf, "spots", spots, sizeof(spots)) == ESP_OK) {
+            cfg.count = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(spots, ";", &save);
+                 tok && cfg.count < PLANT_SPOT_MAX;
+                 tok = strtok_r(NULL, ";", &save)) {
+                float b = 0.0f, t = 0.0f;
+                int radius = cfg.default_radius_mm ? cfg.default_radius_mm : PLANT_DEFAULT_RADIUS_MM;
+                int n = sscanf(tok, "%f:%f:%d", &b, &t, &radius);
+                if (n >= 2 && t >= 100.0f) {
+                    while (b < 0.0f) b += 360.0f;
+                    while (b >= 360.0f) b -= 360.0f;
+                    if (radius < 50) radius = 50;
+                    if (radius > 3000) radius = 3000;
+                    cfg.spots[cfg.count++] = (plant_spot_t){
+                        .bearing_deg = b,
+                        .throw_mm = t,
+                        .radius_mm = (uint16_t)radius,
+                    };
+                }
+            }
+        }
+        esp_err_t r = plant_cfg_save(zid, &cfg);
+        if (r != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "save failed");
+            return ESP_OK;
+        }
+    }
+
+    plant_usage_t usage;
+    plant_usage_load(zid, &usage, time(NULL));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    HTTP_CONN_CLOSE(req);
+    char out[768];
+    int n = snprintf(out, sizeof(out),
+        "{\"ok\":true,\"id\":%u,\"enabled\":%s,\"count\":%u,"
+        "\"gal_x10\":%u,\"weekly_limit_x10\":%u,\"gpm_x10\":%u,"
+        "\"weekly_used_x10\":%u,\"spots\":[",
+        (unsigned)zid, cfg.enabled ? "true" : "false", (unsigned)cfg.count,
+        (unsigned)cfg.gal_x10, (unsigned)cfg.weekly_limit_x10,
+        (unsigned)cfg.gpm_x10, (unsigned)usage.used_x10);
+    for (uint8_t i = 0; i < cfg.count && n < (int)sizeof(out) - 80; i++) {
+        const plant_spot_t *sp = &cfg.spots[i];
+        n += snprintf(out + n, sizeof(out) - n,
+            "%s{\"bearing_deg\":%.1f,\"throw_mm\":%.0f,\"radius_mm\":%u}",
+            i ? "," : "", sp->bearing_deg, sp->throw_mm, (unsigned)sp->radius_mm);
+    }
+    n += snprintf(out + n, sizeof(out) - n, "]}");
+    httpd_resp_send(req, out, n);
+    return ESP_OK;
+}
+
 // POST /api/schedule/clear -> wipe all entries. Convenience for the
 // "Clear all" button on the editor; same effect as POSTing an empty text=.
 static esp_err_t api_schedule_clear_handler(httpd_req_t *req)
@@ -15447,7 +15838,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 66;  // MUST be set before httpd_start (cfg is copied there);
+    cfg.max_uri_handlers  = 80;  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
                                  // (b378: was 40 and silently dropped every handler past #40,
                                  //  including /valve/probe and all /fs/* -- the post-start
@@ -15494,6 +15885,8 @@ static void zone_web_start(void)
         {.uri="/api/schedule/clear", .method=HTTP_POST, .handler=api_schedule_clear_handler},
         {.uri="/api/schedule/delay", .method=HTTP_POST, .handler=api_schedule_delay_handler},
         {.uri="/api/zone",        .method=HTTP_GET,  .handler=api_zone_handler},
+        {.uri="/api/zone/plants", .method=HTTP_GET,  .handler=api_zone_plants_handler},
+        {.uri="/api/zone/plants", .method=HTTP_POST, .handler=api_zone_plants_handler},
         {.uri="/api/zone/name",   .method=HTTP_POST, .handler=api_zone_name_handler},
         {.uri="/api/zone/delete", .method=HTTP_POST, .handler=api_zone_delete_handler},
         {.uri="/api/device/name", .method=HTTP_POST, .handler=api_device_name_handler},
@@ -15530,7 +15923,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 64,
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 80,
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -15878,6 +16271,7 @@ int irrigoto_get_mode(void)
     // s_web_water_mode: 0=idle, 1-4=metered/pulse, 5-6=gentle, 7=smooth, 8=serpentine
     // Map to HA options: 0=Pulse, 1=Gentle, 2=Smooth, 3=Serpentine (b431)
     if (s_web_water_mode == 8)                     return 3;  // serpentine
+    if (s_web_water_mode == WATER_MODE_PLANTS)     return 4;  // plants
     if (s_web_water_mode == 7)                     return 2;  // smooth
     if (s_web_water_mode == 5 || s_web_water_mode == 6) return 1; // gentle
     return 0;  // pulse / idle
@@ -15887,6 +16281,7 @@ void irrigoto_get_status(char *buf, size_t len)
 {
     if (s_web_water_mode != 0) {
         const char *mname =
+            (s_web_water_mode == WATER_MODE_PLANTS)    ? "plants" :
             (s_web_water_mode == 8)                    ? "serpentine"  :   // b423
             (s_web_water_mode == 7)                    ? "smooth" :
             (s_web_water_mode >= 5)                    ? "gentle" : "pulse";
@@ -16405,6 +16800,7 @@ static int schedule_web_mode(uint8_t mode)
         case 0:  return 1;  // Pulse
         case 1:  return 5;  // Gentle
         case 3:  return 8;  // Serpentine (b431)
+        case 4:  return WATER_MODE_PLANTS;  // Plant spots
         default: return 7;  // Smooth
     }
 }
@@ -16921,6 +17317,7 @@ static int schedule_estimate_duration_min(uint8_t zone, uint8_t mode, uint8_t de
     int d = (depth >= 1 && depth <= 8) ? depth : 1;
     int base;
     switch (mode) {
+        case 4:  base = 8;  break;  // plant spots: conservative placeholder until per-zone config is loaded
         case 3:  base = 12; break;  // serpentine (b435: Edge measured ~10.5 min/eighth)
         case 2:  base = 30; break;  // smooth (adaptive)
         case 1:  base = 15; break;  // gentle, per 1/8"
@@ -17051,7 +17448,7 @@ bool irrigoto_schedule_set_text(const char *text)
             ESP_LOGW(TAG, "%s", s_sched_last_status);
             return false;
         }
-        if (z < 1 || z > 250 || m < 0 || m > 3 || d < 0 || d > 8 ||   // b435: 3=Serpentine
+        if (z < 1 || z > 250 || m < 0 || m > 4 || d < 0 || d > 8 ||   // b435: 3=Serpentine; 4=Plant spots
             hh < 0 || hh > 23 || mm < 0 || mm > 59 ||
             days < 0 || days > 127 || en < 0 || en > 1) {
             snprintf(s_sched_last_status, sizeof(s_sched_last_status),
@@ -17174,7 +17571,7 @@ bool irrigoto_schedule_sync_text(const char *text)
             return false;
         }
         if (tomb == 0) {
-            if (z < 1 || z > 250 || m < 0 || m > 3 || d < 0 || d > 8 ||   // b435: 3=Serpentine
+            if (z < 1 || z > 250 || m < 0 || m > 4 || d < 0 || d > 8 ||   // b435: 3=Serpentine; 4=Plant spots
                 hh < 0 || hh > 23 || mm < 0 || mm > 59 ||
                 days < 0 || days > 127 || en < 0 || en > 1 ||
                 src < 0 || src > 3) {

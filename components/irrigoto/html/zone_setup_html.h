@@ -1,4 +1,4 @@
-/* Auto-generated from zone_setup.html -- do not edit directly */
+/* Auto-generated from zone_setup.html -- edit the .html, then run regen.py */
 R"ZONEHTML(
 <!DOCTYPE html>
 <html lang="en">
@@ -311,6 +311,7 @@ header{
   <button class="sbtn" onclick="doAct('clear')">✕ Clear</button>
   <button class="sbtn" id="btn-path" onclick="togglePath()">◎ Path</button>
   <button class="sbtn" id="btn-heatmap" onclick="toggleHeatmap()">🌡 Depth</button>
+  <button class="sbtn" id="btn-plants" onclick="togglePlants()">🌱 Plants</button>
   <button class="sbtn" id="btn-edit" onclick="toggleEdit()">✎ Edit</button>
 </div>
 <!-- b400: edit-mode toolbar (drag/delete interior points). Shown only while
@@ -319,6 +320,14 @@ header{
   <button class="sbtn" onclick="deleteSelPoint()">🗑 Delete pt</button>
   <button class="sbtn" id="btn-edit-save" onclick="saveEdits()">✓ Save edits</button>
   <button class="sbtn" onclick="cancelEdit()">✕ Done</button>
+</div>
+
+<div id="plant-bar" style="display:none;gap:6px;padding:8px 16px;align-items:center;justify-content:center;flex-wrap:wrap">
+  <button class="sbtn" onclick="plantAddCurrent()">＋ Add spot</button>
+  <button class="sbtn" onclick="plantDeleteSel()">🗑 Delete spot</button>
+  <button class="sbtn" onclick="plantClear()">✕ Clear spots</button>
+  <button class="sbtn" id="btn-plant-save" onclick="savePlants()">✓ Save spots</button>
+  <button class="sbtn" onclick="cancelPlants()">Done</button>
 </div>
 
 <div id="name-row">
@@ -341,6 +350,9 @@ let ST = {bearing:0, throw_mm:4267, throw_ft:14, pressure_pct:50, water:false, p
 // b400: on-device point editor state. _cx/_cy/_maxR are captured each draw() so
 // the canvas pointer handlers can hit-test / invert the projection.
 let _editMode=false, _selPt=-1, _dragging=false, _cx=0, _cy=0, _maxR=1;
+let _plantMode=false, _selSpot=-1, _dragSpot=false;
+let plantCfg={enabled:true,count:0,gal_x10:10,weekly_limit_x10:0,gpm_x10:10,spots:[]};
+const PLANT_SPOT_MAX=16;
 // Display scale (mm at canvas rim): device's reported max throw (calibrated
 // reach, or live throw if pressure exceeds the cal table) + 3ft (914mm) buffer.
 // Tracks calibration, so the radar stays correctly scaled at any water pressure.
@@ -902,6 +914,20 @@ function draw(){
     ctx.fillText(i+1, x, y);
   });
 
+  // Anonymous plant spots — independent of the polygon. The polygon is only
+  // a visual/optional safety boundary for beds that already have one.
+  (plantCfg.spots||[]).forEach((sp,i)=>{
+    const rr=(sp.throw_mm/_edScale())*maxR;
+    const rad=(sp.bearing_deg-90)*Math.PI/180;
+    const x=cx+Math.cos(rad)*rr, y=cy+Math.sin(rad)*rr;
+    const sel=(_plantMode && i===_selSpot);
+    ctx.beginPath(); ctx.arc(x,y, sel?9:7, 0, Math.PI*2);
+    ctx.fillStyle = sel ? '#00e87a' : '#38bdf8';
+    ctx.shadowBlur = sel?18:12; ctx.shadowColor = sel?'#00e87a':'#38bdf8';
+    ctx.fill(); ctx.shadowBlur=0;
+    ctx.strokeStyle='rgba(6,12,16,.75)'; ctx.lineWidth=2; ctx.stroke();
+  });
+
   // Sprinkler
   ctx.beginPath(); ctx.arc(cx,cy,7,0,Math.PI*2);
   ctx.fillStyle='#ffd700';
@@ -932,7 +958,9 @@ function applyState(s){
   if(s.name && nameEl !== document.activeElement && !nameEl.dataset.edited)
     nameEl.value=s.name;
   document.getElementById('v-bearing').textContent=s.bearing.toFixed(1)+'°';
-  document.getElementById('v-points').textContent=s.points.length+' / 36';
+  document.getElementById('v-points').textContent=_plantMode
+    ? ((plantCfg.spots||[]).length+' / '+PLANT_SPOT_MAX+' spots')
+    : (s.points.length+' / 36');
   document.getElementById('btn-water').classList.toggle('on',s.water);
   document.getElementById('btn-save').disabled=(s.points.length<3);
   document.getElementById('btn-dn').classList.toggle('at-limit', !!s.at_min);
@@ -1043,6 +1071,86 @@ function toast(msg){
   t._t=setTimeout(()=>t.style.opacity='0',2000);
 }
 
+
+// ── Plant spot editor ─────────────────────────────────────────────
+function _plantUI(on){
+  document.getElementById('plant-bar').style.display = on?'flex':'none';
+  const btn=document.getElementById('btn-plants');
+  btn.style.color = on ? 'var(--green)' : '';
+  btn.style.borderColor = on ? 'var(--green)' : '';
+  CV.style.touchAction = (on||_editMode)?'none':'';
+}
+function _normalizePlants(d){
+  plantCfg={enabled:d.enabled!==false,count:+d.count||0,gal_x10:+d.gal_x10||10,
+    weekly_limit_x10:+d.weekly_limit_x10||0,gpm_x10:+d.gpm_x10||10,
+    spots:(d.spots||[]).map(s=>({bearing_deg:+s.bearing_deg||0,throw_mm:+s.throw_mm||0,radius_mm:+s.radius_mm||350}))};
+}
+async function loadPlants(){
+  try{
+    const r=await fetch('/api/zone/plants?id='+encodeURIComponent(_zoneIdParam),{cache:'no-store'});
+    if(r.ok) _normalizePlants(await r.json());
+  }catch(e){}
+  draw();
+}
+function togglePlants(){
+  if(_plantMode){ cancelPlants(); return; }
+  if(_editMode) exitEdit();
+  _plantMode=true; _selSpot=-1; _dragSpot=false; _plantUI(true);
+  loadPlants();
+  toast('Plants: tap map or aim + Add spot');
+  draw();
+}
+function cancelPlants(){ _plantMode=false; _selSpot=-1; _dragSpot=false; _plantUI(false); draw(); }
+function _polarFromCanvas(x,y){
+  const dx=x-_cx, dy=y-_cy;
+  let r=Math.hypot(dx,dy)/_maxR*_edScale(); if(r>_edScale()) r=_edScale(); if(r<0) r=0;
+  let deg=Math.atan2(dy,dx)*180/Math.PI+90; deg=((deg%360)+360)%360;
+  return {bearing_deg:deg,throw_mm:r,radius_mm:350};
+}
+function _hitSpot(x,y){
+  let best=-1, bd=1e9; const thr=Math.max(18,_maxR*0.065);
+  (plantCfg.spots||[]).forEach((sp,i)=>{
+    const rr=(sp.throw_mm/_edScale())*_maxR, a=(sp.bearing_deg-90)*Math.PI/180;
+    const d=Math.hypot(_cx+Math.cos(a)*rr-x, _cy+Math.sin(a)*rr-y);
+    if(d<bd){ bd=d; best=i; }
+  });
+  return bd<=thr ? best : -1;
+}
+function plantAddCurrent(){
+  if(!plantCfg.spots) plantCfg.spots=[];
+  if(plantCfg.spots.length>=PLANT_SPOT_MAX){ toast('Max '+PLANT_SPOT_MAX+' spots'); return; }
+  plantCfg.spots.push({bearing_deg:ST.bearing,throw_mm:ST.throw_mm,radius_mm:350});
+  _selSpot=plantCfg.spots.length-1; draw(); toast('Spot added');
+}
+function plantDeleteSel(){
+  if(_selSpot<0 || _selSpot>=plantCfg.spots.length){ toast('Tap a spot first'); return; }
+  plantCfg.spots.splice(_selSpot,1); _selSpot=-1; draw(); toast('Spot deleted');
+}
+function plantClear(){
+  if(!plantCfg.spots.length) return;
+  if(!confirm('Clear all plant spots for this zone?')) return;
+  plantCfg.spots=[]; _selSpot=-1; draw();
+}
+function _spotsPayload(){
+  return (plantCfg.spots||[]).map(sp=>
+    (+sp.bearing_deg).toFixed(1)+':'+(+sp.throw_mm).toFixed(0)+':'+(sp.radius_mm||350)
+  ).join(';');
+}
+async function savePlants(){
+  const btn=document.getElementById('btn-plant-save'); if(btn) btn.disabled=true;
+  const body='id='+encodeURIComponent(_zoneIdParam)+'&enabled=1&gal_x10='+encodeURIComponent(plantCfg.gal_x10||10)+
+    '&weekly_limit_x10='+encodeURIComponent(plantCfg.weekly_limit_x10||0)+
+    '&gpm_x10='+encodeURIComponent(plantCfg.gpm_x10||10)+
+    '&spots='+encodeURIComponent(_spotsPayload());
+  try{
+    const r=await fetch('/api/zone/plants',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
+    if(!r.ok) throw new Error(r.status);
+    _normalizePlants(await r.json());
+    toast('Plant spots saved ✓'); draw();
+  }catch(e){ toast('Save spots failed'); }
+  finally{ if(btn) btn.disabled=false; }
+}
+
 // ── Poll ────────────────────────────────────────────────────────
 // Sequential: schedule next poll only after current fetch completes.
 // ── b400: on-device point editor (drag / delete interior points) ─────
@@ -1083,20 +1191,33 @@ function _hitPoint(x,y){
   return bd<=thr ? best : -1;
 }
 CV.addEventListener('pointerdown',e=>{
+  const {x,y}=_cxy(e);
+  if(_plantMode){
+    const h=_hitSpot(x,y);
+    if(h>=0){ _selSpot=h; _dragSpot=true; }
+    else if((plantCfg.spots||[]).length<PLANT_SPOT_MAX){
+      if(!plantCfg.spots) plantCfg.spots=[];
+      plantCfg.spots.push(_polarFromCanvas(x,y));
+      _selSpot=plantCfg.spots.length-1; _dragSpot=true;
+      toast('Spot added');
+    } else toast('Max '+PLANT_SPOT_MAX+' spots');
+    try{CV.setPointerCapture(e.pointerId);}catch(_){}
+    draw(); return;
+  }
   if(!_editMode) return;
-  const {x,y}=_cxy(e); const h=_hitPoint(x,y);
+  const h=_hitPoint(x,y);
   _selPt=h; _dragging=(h>=0);
   if(_dragging){ try{CV.setPointerCapture(e.pointerId);}catch(_){} }
   draw();
 });
 CV.addEventListener('pointermove',e=>{
+  const {x,y}=_cxy(e);
+  if(_plantMode&&_dragSpot&&_selSpot>=0){ plantCfg.spots[_selSpot]=_polarFromCanvas(x,y); draw(); return; }
   if(!_editMode||!_dragging||_selPt<0) return;
-  const {x,y}=_cxy(e); const dx=x-_cx, dy=y-_cy;
-  let r=Math.hypot(dx,dy)/_maxR*_edScale(); if(r>_edScale()) r=_edScale(); if(r<0) r=0;
-  let deg=Math.atan2(dy,dx)*180/Math.PI+90; deg=((deg%360)+360)%360;
-  ST.points[_selPt].throw_mm=r; ST.points[_selPt].deg=deg; draw();
+  const pt=_polarFromCanvas(x,y);
+  ST.points[_selPt].throw_mm=pt.throw_mm; ST.points[_selPt].deg=pt.bearing_deg; draw();
 });
-function _endDrag(){ _dragging=false; }
+function _endDrag(){ _dragging=false; _dragSpot=false; }
 CV.addEventListener('pointerup',_endDrag);
 CV.addEventListener('pointercancel',_endDrag);
 window.addEventListener('pointerup',_endDrag);   // safety: release if it ends off-canvas
@@ -1134,6 +1255,7 @@ async function poll(){
 // ── Init ────────────────────────────────────────────────────────
 window.addEventListener('resize',resizeCanvas);
 resizeCanvas();
+loadPlants();
 // Mark name field edited when user types so polling won't overwrite it
 document.getElementById('zone-name').addEventListener('input',function(){
   this.dataset.edited='1';
